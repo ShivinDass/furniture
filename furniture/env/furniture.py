@@ -1,5 +1,7 @@
 """ Define base environment class FurnitureEnv. """
-
+import cv2
+import copy
+import h5py
 import logging
 import os
 import pickle
@@ -57,6 +59,7 @@ class FurnitureEnv(metaclass=EnvMeta):
         Initializes class with the configuration.
         """
         self._cfg = cfg
+        # print(cfg)
 
         # default env config
         self._max_episode_steps = cfg.max_episode_steps
@@ -1384,6 +1387,7 @@ class FurnitureEnv(metaclass=EnvMeta):
                 quat = Quaternion(self.init_quat[part])
                 rad = mjcf_obj.get_horizontal_radius(part)
                 self.fixed_parts.append((part, rad, Qpos(pos[0], pos[1], pos[2], quat)))
+        # self.mujoco_model.initializer.rng = np.random.RandomState(self._cfg.seed)
         return self.mujoco_model.place_objects(fixed_parts=self.fixed_parts)
 
     def _reset(self, furniture_id=None, background=None):
@@ -2389,6 +2393,335 @@ class FurnitureEnv(metaclass=EnvMeta):
                 init_origin()
 
             time.sleep(0.05)
+
+    def collect_oculus_teleop_traj(self, cfg=None, n_traj=1, file_path=None, file_suffix="teleop_data.hdf5", append=False):
+        """
+        Runs the environment with Oculus Quest2
+
+        cfg: Configuration for setting up the environment
+
+        n_traj: Number of trajectories to collect
+
+        file_path: If file_path is None then doesn't save the teleoperation trjaectories else
+        the teleoperation data to the file_path/{self.prefix+file_suffix}
+        
+        append: append the new demonstrations to the file_path if it already exists
+        """
+        try:
+            from oculus_reader.reader import OculusReader
+        except ImportError:
+            raise Exception(
+                "Please install oculus_reader following https://github.com/rail-berkeley/oculus_reader"
+            )
+
+        fix_quat = [1, 0, 0, 0]
+        vr = OculusReader()
+
+        if cfg is None:
+            cfg = self._cfg
+        assert cfg.render, "Set --render True to see the viewer"
+
+        if cfg.furniture_name is not None:
+            cfg.furniture_id = furniture_name2id[cfg.furniture_name]
+        
+        ob = self.reset(cfg.furniture_id, cfg.unity.background)
+        
+        if cfg.render:
+            self.render()
+
+        # set initial pose of controller as origin
+        prev_handle_press = {arm: False for arm in self._arms}
+        prev_gripper_press = {arm: False for arm in self._arms}
+        prev_vr_pos = {arm: None for arm in self._arms}
+        prev_vr_quat = {arm: None for arm in self._arms}
+        prev_sim_pos = {arm: None for arm in self._arms}
+        prev_sim_quat = {arm: None for arm in self._arms}
+        default_action_pos = {arm: np.array([0, 0, 0]) for arm in self._arms}
+        if self._control_type == "ik":
+            default_action_rot = {arm: np.array([0, 0, 0]) for arm in self._arms}
+        elif self._control_type == "ik_quaternion":
+            default_action_rot = {arm: np.array([1, 0, 0, 0]) for arm in self._arms}
+
+        def get_pose_and_button():
+            poses, buttons = vr.get_transformations_and_buttons()
+
+            handle_press = {"right": False, "left": False}
+            vr_poses = {"right": None, "left": None}
+            gripper_press = {"right": False, "left": False}
+
+            handle_press["right"] = buttons.get("RTr", False)
+            handle_press["left"] = buttons.get("LTr", False)
+            gripper_press["right"] = buttons.get("RG", False)
+            gripper_press["left"] = buttons.get("LG", False)
+            connect_press = buttons.get("A", False) or buttons.get("X", False)
+            reset_press = buttons.get("B", False) or buttons.get("Y", False)
+
+            if handle_press["right"]:
+                vr_poses["right"] = poses.get("r", None)
+            if handle_press["left"]:
+                vr_poses["left"] = poses.get("l", None)
+
+            return vr_poses, handle_press, gripper_press, connect_press, reset_press
+
+        def rel_pos(a, b):
+            return a - b
+
+        def rel_quat(a, b):
+            return np.array(list(Quaternion(a).inverse * Quaternion(b)))
+
+        def quat_to_rot(quat):
+            rot = np.array(
+                T.quaternion_to_euler(*T.convert_quat(np.array(quat), to="xyzw"))
+            )
+            # swap rotation axes
+            rot[0], rot[1], rot[2] = 0, rot[0], 0
+            # rot[0], rot[1], rot[2] = 0, 0, rot[1]
+            # rot[0], rot[1], rot[2] = rot[2], 0, 0
+            # rot[0], rot[1], rot[2] = rot[2], rot[0], rot[1]
+            # logger.info(rot)
+
+            if abs(rot[0]) < 1:
+                rot[0] = 0
+            if abs(rot[1]) < 1:
+                rot[1] = 0
+            if abs(rot[2]) < 1:
+                rot[2] = 0
+            return rot
+
+        def get_action(vr_pos, vr_quat, arm):
+            rel_vr_pos = rel_pos(prev_vr_pos[arm], vr_pos)
+            # relative movement speed between VR and simulation
+            rel_vr_pos *= 3.5
+            # swap y, z axes
+            rel_vr_pos[0] = -rel_vr_pos[0]
+            rel_vr_pos[1], rel_vr_pos[2] = rel_vr_pos[2], rel_vr_pos[1]
+            rel_vr_quat = rel_quat(prev_vr_quat[arm], vr_quat)  # wxyz
+
+            sim_pos = self.sim.data.get_body_xpos(f"{arm}_hand").copy()
+            sim_quat = self.sim.data.get_body_xquat(f"{arm}_hand").copy()  # wxyz
+            sim_quat = T.convert_quat(T.mat2quat(self._right_hand_orn), to="wxyz")
+
+            rel_sim_pos = rel_pos(prev_sim_pos[arm], sim_pos)
+            rel_sim_quat = rel_quat(prev_sim_quat[arm], sim_quat)  # wxyz
+
+            action_pos = rel_pos(rel_sim_pos, rel_vr_pos)
+            action_quat = rel_quat(rel_sim_quat, rel_vr_quat)  # wxyz
+            action_quat = rel_quat(sim_quat, vr_quat)
+            action_rot = quat_to_rot(action_quat) / 100
+
+            if self._control_type == "ik":
+                return action_pos, action_rot
+            elif self._control_type == "ik_quaternion":
+                return action_pos, action_quat
+
+        def euler_to_quat(roll, pitch, yaw):
+            qx = np.sin(roll/2) * np.cos(pitch/2) * np.cos(yaw/2) - np.cos(roll/2) * np.sin(pitch/2) * np.sin(yaw/2)
+            qy = np.cos(roll/2) * np.sin(pitch/2) * np.cos(yaw/2) + np.sin(roll/2) * np.cos(pitch/2) * np.sin(yaw/2)
+            qz = np.cos(roll/2) * np.cos(pitch/2) * np.sin(yaw/2) - np.sin(roll/2) * np.sin(pitch/2) * np.cos(yaw/2)
+            qw = np.cos(roll/2) * np.cos(pitch/2) * np.cos(yaw/2) + np.sin(roll/2) * np.sin(pitch/2) * np.sin(yaw/2)
+            
+            return np.array([qw, qx, qy, qz])
+
+        actions = []
+        rewards = []
+        terminals = []
+        observations = []
+        active = []
+
+        if append:
+            filename = self.file_prefix + file_suffix
+            filename = os.path.join(file_path, filename)
+            if os.path.exists(filename):
+                with h5py.File(filename, 'r') as f:
+                    actions = np.array(f['actions'])
+                    rewards = np.array(f['rewards'])
+                    terminals = np.array(f['terminals'])
+                    observations = np.array(f['observations'])
+                    active = np.array(f['active'])
+
+        ep_actions = []
+        ep_rewards = []
+        ep_terminals = []
+        ep_observations = [np.concatenate((ob['object_ob'], ob['robot_ob']), axis=0)]
+        ep_active = []
+
+        flip_axis = np.array([[1, 0, 0], [0, 0, -1], [0, -1, 0]])
+        tmp_vr_quat = None
+        t = 0
+        select = {"left": -1, "right": -1}
+        first_act_flag = True
+        while n_traj:
+            (
+                vr_poses,
+                handle_press,
+                gripper_press,
+                connect_press,
+                reset_press,
+            ) = get_pose_and_button()
+
+            reset = False
+            connect = -1
+            action_pos = default_action_pos.copy()
+            action_rot = default_action_rot.copy()
+            
+            save_traj_flag = False
+            for arm in self._arms:
+                if handle_press[arm]:
+                    save_traj_flag = True
+                    if prev_handle_press[arm]:
+                        # compute action
+                        vr_pos = vr_poses[arm][:3, 3]
+                        tmp_vr_quat = T.convert_quat(
+                            T.mat2quat(vr_poses[arm][:3, :3]), to="wxyz"
+                        )
+                        # tmp_vr_quat = T.euler_to_quat([270, 0, 180],
+                        # tmp_vr_quat)  # matches world-frame orientation
+                        tmp_vr_quat = T.euler_to_quat([90, 0, 90], tmp_vr_quat)
+                        tmp_vr_mat = Quaternion(tmp_vr_quat).rotation_matrix
+                        tmp_vr_mat = flip_axis.T @ tmp_vr_mat @ flip_axis
+                        tmp_vr_mat = self.pose_in_base_from_pose(vr_pos, tmp_vr_mat)[
+                            :3, :3
+                        ]
+                        tmp_vr_quat = T.convert_quat(T.mat2quat(tmp_vr_mat), to="wxyz")
+                        action_pos[arm], action_rot[arm] = get_action(
+                            vr_pos, tmp_vr_quat, arm
+                        )
+                    else:
+                        # reset reference vr pose
+                        prev_vr_pos[arm] = vr_poses[arm][:3, 3]
+                        tmp_vr_quat = T.convert_quat(
+                            T.mat2quat(vr_poses[arm][:3, :3]), to="wxyz"
+                        )
+                        tmp_vr_quat = T.euler_to_quat([90, 0, 90], tmp_vr_quat)
+                        tmp_vr_mat = Quaternion(tmp_vr_quat).rotation_matrix
+                        tmp_vr_mat = flip_axis.T @ tmp_vr_mat @ flip_axis
+                        tmp_vr_mat = self.pose_in_base_from_pose(
+                            prev_vr_pos[arm], tmp_vr_mat
+                        )[:3, :3]
+                        tmp_vr_quat = T.convert_quat(T.mat2quat(tmp_vr_mat), to="wxyz")
+                        prev_vr_quat[arm] = tmp_vr_quat
+
+                        # reset reference robot pose
+                        prev_sim_pos[arm] = self.sim.data.get_body_xpos(
+                            f"{arm}_hand"
+                        ).copy()
+                        prev_sim_quat[arm] = self.sim.data.get_body_xquat(
+                            f"{arm}_hand"
+                        ).copy()
+
+                if prev_gripper_press[arm] and not gripper_press[arm]:
+                    select[arm] *= -1
+
+                prev_handle_press[arm] = handle_press[arm]
+                prev_gripper_press[arm] = gripper_press[arm]
+
+            if tmp_vr_quat is not None:
+                self._set_quat("VR_R", tmp_vr_quat)
+
+            if reset_press:
+                reset = True
+            if connect_press:
+                connect = 1
+
+            if cfg.render:
+                img = self.render(mode="rgb_array")
+                if len(img)>1:
+                    cv2.imshow("B", img[1][:,:,::-1])
+                    cv2.waitKey(1)
+
+            if reset:
+                t = 0
+                first_act_flag = True
+                select = {"left": -1, "right": -1}
+                prev_handle_press = {"right": False, "left": False}
+
+                ob = self.reset(cfg.furniture_id, cfg.unity.background)
+
+                ep_actions = []
+                ep_rewards = []
+                ep_terminals = []
+                ep_observations = [np.concatenate((ob['object_ob'], ob['robot_ob']), axis=0)]
+                ep_active = []
+
+                continue
+            
+            ###################
+            for arm in self._arms:
+                # print(action_rot[arm])
+                action_rot[arm] = fix_quat
+                if first_act_flag:
+                    action_rot[arm] = np.array([-0.36613403, -0.30808327,  0.49565844,  0.72481258])#for simple task: np.array([-0.43139604, -0.36299795,  0.58400768,  0.58400768]) #3*euler_to_quat(0.8, 0.2, 1.2*np.pi)
+            ###################
+
+            action_items = []
+            for arm in self._arms:
+                action_items.append(action_pos[arm])
+                if self._control_type == "ik":
+                    action_items.append(action_rot[arm] / self._rotate_speed)
+                else:
+                    action_items.append(action_rot[arm])
+            for arm in self._arms:
+                action_items.append([select[arm]])
+            action_items.append([connect])
+
+            action = np.hstack(action_items)
+            action = np.clip(action, -1.0, 1.0)
+
+            # logger.info(str(t) + " Take action: " + str(action))
+            ob, reward, done, info = self.step(action)
+            
+            # if connect_press:
+            #     done = True
+            if not first_act_flag:
+                ep_actions.append(action)
+                ep_rewards.append(reward)
+                ep_terminals.append(done)
+                ep_active.append(save_traj_flag)
+                if not done:
+                    ep_observations.append(np.concatenate((ob['object_ob'], ob['robot_ob']), axis=0))
+
+            if first_act_flag:
+                # print(self._robot_jpos_getter())
+                first_act_flag = False
+
+            t += 1
+            if done: 
+                first_act_flag = True
+
+                actions = np.concatenate((actions, ep_actions), axis=0) if len(actions) else np.array(copy.deepcopy(ep_actions))
+                rewards = np.concatenate((rewards, ep_rewards), axis=0) if len(rewards) else np.array(copy.deepcopy(ep_rewards))
+                terminals = np.concatenate((terminals, ep_terminals), axis=0) if len(terminals) else np.array(copy.deepcopy(ep_terminals))
+                active = np.concatenate((active, ep_active), axis=0) if len(active) else np.array(copy.deepcopy(ep_active))
+                observations = np.concatenate((observations, ep_observations), axis=0) if len(observations) else np.array(copy.deepcopy(ep_observations))
+
+                ob = self.reset(cfg.furniture_id, cfg.unity.background)
+
+                ep_actions = []
+                ep_rewards = []
+                ep_terminals = []
+                ep_observations = [np.concatenate((ob['object_ob'], ob['robot_ob']), axis=0)]
+                ep_active = []
+                
+                t = 0
+                select = {"left": -1, "right": -1}
+                prev_handle_press = {"right": False, "left": False}
+
+                n_traj -= 1
+
+            time.sleep(0.02)
+    
+        if file_path:
+            if not os.path.exists(file_path):
+                os.makedirs(file_path)
+            filename = self.file_prefix + file_suffix
+            filename = os.path.join(file_path, filename)
+
+            with h5py.File(filename, 'w') as f:
+                f.create_dataset("actions", data=actions)
+                f.create_dataset("observations", data=observations)
+                f.create_dataset("rewards", data=rewards)
+                f.create_dataset("terminals", data=terminals)
+                f.create_dataset("active", data=active)
 
     def run_vr_oculus(self, cfg=None):
         """
@@ -3476,7 +3809,10 @@ class FurnitureEnv(metaclass=EnvMeta):
         object_qpos = self.sim.data.get_joint_qpos(name)
         assert object_qpos.shape == (7,)
         object_qpos[:3] = pos
-        object_qpos[3:] = rot
+        object_qpos[3] = rot[0]
+        object_qpos[4] = rot[1]
+        object_qpos[5] = rot[2]
+        object_qpos[6] = rot[3]
         self.sim.data.set_joint_qpos(name, object_qpos)
 
     def _set_qpos0(self, name, qpos):

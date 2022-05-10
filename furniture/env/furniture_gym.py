@@ -28,6 +28,7 @@ class FurnitureGym(gym.Env):
         self.run_demo = self.env.run_demo
         self.run_vr_htc = self.env.run_vr_htc
         self.run_vr_oculus = self.env.run_vr_oculus
+        self.collect_oculus_teleop_traj = self.env.collect_oculus_teleop_traj
 
         # policy sequencing methods
         self.num_subtask = self.env.num_subtask

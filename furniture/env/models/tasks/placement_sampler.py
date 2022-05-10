@@ -127,9 +127,9 @@ class UniformRandomSampler(ObjectPositionSampler):
         minimum = min(rot_range)
         maximum = max(rot_range)
         # generate noise in euler, then convert noise to quat and multiply orig quat with noise quat
-        xy_noise = self.rng.uniform(high=maximum, low=maximum)
+        xy_noise = 0
         yz_noise = 0
-        xz_noise = 0
+        xz_noise = self.rng.uniform(high=maximum, low=minimum)
         euler_noise = [xy_noise, yz_noise, xz_noise]
         rotated_quat = T.euler_to_quat(euler_noise, quaternion)
         return rotated_quat
