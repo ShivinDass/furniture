@@ -1,4 +1,5 @@
 """ Define base environment class FurnitureEnv. """
+from threading import active_count
 import cv2
 import copy
 import h5py
@@ -6,6 +7,8 @@ import logging
 import os
 import pickle
 import time
+import torch
+import imp
 from collections import OrderedDict
 from sys import platform
 
@@ -36,6 +39,10 @@ from ..util.video_recorder import VideoRecorder
 from ..util.logger import logger
 from ..util import Qpos, PrettySafeLoader
 
+from assisted_teleop.configs.default_data_configs.furniture import data_spec
+from assisted_teleop.utils.general_utils import AttrDict
+from assisted_teleop.models.bc_ensemble_mdl import BCEnsembleMdl
+from assisted_teleop.components.checkpointer import CheckpointHandler, get_config_path
 
 np.set_printoptions(suppress=True)
 
@@ -193,6 +200,8 @@ class FurnitureEnv(metaclass=EnvMeta):
                 self._furniture_id = cfg.furniture_id
             self._load_model_object()
             self._furniture_id = None
+        
+        self.vr = None
 
     def update_config(self, cfg):
         """Updates private member variables with @cfg dictionary."""
@@ -331,7 +340,7 @@ class FurnitureEnv(metaclass=EnvMeta):
             self._demo.add(ob=ob)
             self._demo.add(low_level_ob=self._get_obs(include_qpos=True))
 
-        return ob
+        return self.reset_vr() # return ob
 
     def _init_random(self, size, name):
         """
@@ -443,7 +452,6 @@ class FurnitureEnv(metaclass=EnvMeta):
         ):
             self._success = True
             done = True
-
         reward = 0
         info = {}
         return ob, reward, done, info
@@ -1104,6 +1112,10 @@ class FurnitureEnv(metaclass=EnvMeta):
                         T.lookat_to_quat(up1, forward1_rotated), "wxyz"
                     )
                     break
+        
+        #Vertical distance should be bounded while connecting
+        if abs(site1_xpos[2] - site2_xpos[2]) > 0.01:
+            return False
 
         if (
             pos_dist < cfg.alignment_pos_dist
@@ -2394,6 +2406,7 @@ class FurnitureEnv(metaclass=EnvMeta):
 
             time.sleep(0.05)
 
+    # Collect trajectories using oculus teleop
     def collect_oculus_teleop_traj(self, cfg=None, n_traj=1, file_path=None, file_suffix="teleop_data.hdf5", append=False):
         """
         Runs the environment with Oculus Quest2
@@ -2414,7 +2427,6 @@ class FurnitureEnv(metaclass=EnvMeta):
                 "Please install oculus_reader following https://github.com/rail-berkeley/oculus_reader"
             )
 
-        fix_quat = [1, 0, 0, 0]
         vr = OculusReader()
 
         if cfg is None:
@@ -2475,10 +2487,6 @@ class FurnitureEnv(metaclass=EnvMeta):
             )
             # swap rotation axes
             rot[0], rot[1], rot[2] = 0, rot[0], 0
-            # rot[0], rot[1], rot[2] = 0, 0, rot[1]
-            # rot[0], rot[1], rot[2] = rot[2], 0, 0
-            # rot[0], rot[1], rot[2] = rot[2], rot[0], rot[1]
-            # logger.info(rot)
 
             if abs(rot[0]) < 1:
                 rot[0] = 0
@@ -2528,7 +2536,7 @@ class FurnitureEnv(metaclass=EnvMeta):
         observations = []
         active = []
 
-        if append:
+        if file_path and append:
             filename = self.file_prefix + file_suffix
             filename = os.path.join(file_path, filename)
             if os.path.exists(filename):
@@ -2574,8 +2582,6 @@ class FurnitureEnv(metaclass=EnvMeta):
                         tmp_vr_quat = T.convert_quat(
                             T.mat2quat(vr_poses[arm][:3, :3]), to="wxyz"
                         )
-                        # tmp_vr_quat = T.euler_to_quat([270, 0, 180],
-                        # tmp_vr_quat)  # matches world-frame orientation
                         tmp_vr_quat = T.euler_to_quat([90, 0, 90], tmp_vr_quat)
                         tmp_vr_mat = Quaternion(tmp_vr_quat).rotation_matrix
                         tmp_vr_mat = flip_axis.T @ tmp_vr_mat @ flip_axis
@@ -2648,9 +2654,9 @@ class FurnitureEnv(metaclass=EnvMeta):
             ###################
             for arm in self._arms:
                 # print(action_rot[arm])
-                action_rot[arm] = fix_quat
-                if first_act_flag:
-                    action_rot[arm] = np.array([-0.36613403, -0.30808327,  0.49565844,  0.72481258])#for simple task: np.array([-0.43139604, -0.36299795,  0.58400768,  0.58400768]) #3*euler_to_quat(0.8, 0.2, 1.2*np.pi)
+                action_rot[arm] = [1, 0, 0, 0]
+                # if first_act_flag:
+                #     action_rot[arm] = np.array([-0.36613403, -0.30808327,  0.49565844,  0.72481258])#for simple task: np.array([-0.43139604, -0.36299795,  0.58400768,  0.58400768]) #3*euler_to_quat(0.8, 0.2, 1.2*np.pi)
             ###################
 
             action_items = []
@@ -2667,11 +2673,8 @@ class FurnitureEnv(metaclass=EnvMeta):
             action = np.hstack(action_items)
             action = np.clip(action, -1.0, 1.0)
 
-            # logger.info(str(t) + " Take action: " + str(action))
             ob, reward, done, info = self.step(action)
             
-            # if connect_press:
-            #     done = True
             if not first_act_flag:
                 ep_actions.append(action)
                 ep_rewards.append(reward)
@@ -2681,7 +2684,6 @@ class FurnitureEnv(metaclass=EnvMeta):
                     ep_observations.append(np.concatenate((ob['object_ob'], ob['robot_ob']), axis=0))
 
             if first_act_flag:
-                # print(self._robot_jpos_getter())
                 first_act_flag = False
 
             t += 1
@@ -2722,6 +2724,232 @@ class FurnitureEnv(metaclass=EnvMeta):
                 f.create_dataset("rewards", data=rewards)
                 f.create_dataset("terminals", data=terminals)
                 f.create_dataset("active", data=active)
+
+    def reset_vr(self):
+        """
+        Resets the parameters for vr controller and fixes the orientation of the robot.
+        """
+
+        # set initial pose of controller as origin
+        self.prev_handle_press = {arm: False for arm in self._arms}
+        self.prev_gripper_press = {arm: False for arm in self._arms}
+        self.prev_vr_pos = {arm: None for arm in self._arms}
+        self.prev_vr_quat = {arm: None for arm in self._arms}
+        self.prev_sim_pos = {arm: None for arm in self._arms}
+        self.prev_sim_quat = {arm: None for arm in self._arms}
+
+        self.tmp_vr_quat = None
+        self.select = {"left": -1, "right": -1}
+        self.init_vr_pos_set = False
+        
+        #RESET ORIENTATION
+        action_rot = {arm: np.array([-0.36613403, -0.30808327,  0.49565844,  0.72481258]) for arm in self._arms} #for simple task: np.array([-0.43139604, -0.36299795,  0.58400768,  0.58400768]) #3*euler_to_quat(0.8, 0.2, 1.2*np.pi)
+
+        action_items = []
+        for arm in self._arms:
+            action_items.append(np.array([0, 0, 0]))
+            if self._control_type == "ik":
+                action_items.append(action_rot[arm] / self._rotate_speed)
+            else:
+                action_items.append(action_rot[arm])
+        for arm in self._arms:
+            action_items.append([self.select[arm]])
+        action_items.append([1])
+
+        action = np.hstack(action_items)
+        action = np.clip(action, -1.0, 1.0)
+
+        obs, reward, done, info = self.step(action)
+        return obs
+    
+    def initialize_vr(self):
+        if self.vr:
+            return
+        
+        try:
+            from oculus_reader.reader import OculusReader
+        except ImportError:
+            raise Exception(
+                "Please install oculus_reader following https://github.com/rail-berkeley/oculus_reader"
+            )
+
+        self.vr = OculusReader()
+
+    # Get the current vr action and button presses
+    def get_vr_action(self):
+        """
+        Gets the corresponding action from Oculus Quest2
+        """
+        
+        self.initialize_vr()
+        
+        default_action_pos = {arm: np.array([0, 0, 0]) for arm in self._arms}
+        if self._control_type == "ik":
+            default_action_rot = {arm: np.array([0, 0, 0]) for arm in self._arms}
+        elif self._control_type == "ik_quaternion":
+            default_action_rot = {arm: np.array([1, 0, 0, 0]) for arm in self._arms}
+
+        def get_pose_and_button():
+            poses, buttons = self.vr.get_transformations_and_buttons()
+
+            handle_press = {"right": False, "left": False}
+            vr_poses = {"right": None, "left": None}
+            gripper_press = {"right": False, "left": False}
+
+            handle_press["right"] = buttons.get("RTr", False)
+            handle_press["left"] = buttons.get("LTr", False)
+            gripper_press["right"] = buttons.get("RG", False)
+            gripper_press["left"] = buttons.get("LG", False)
+            connect_press = buttons.get("A", False) or buttons.get("X", False)
+            reset_press = buttons.get("B", False) or buttons.get("Y", False)
+
+            #if handle_press["right"]:
+            vr_poses["right"] = poses.get("r", None)
+            if handle_press["left"]:
+                vr_poses["left"] = poses.get("l", None)
+
+            return vr_poses, handle_press, gripper_press, connect_press, reset_press
+
+        def rel_pos(a, b):
+            return a - b
+
+        def rel_quat(a, b):
+            return np.array(list(Quaternion(a).inverse * Quaternion(b)))
+
+        def quat_to_rot(quat):
+            rot = np.array(
+                T.quaternion_to_euler(*T.convert_quat(np.array(quat), to="xyzw"))
+            )
+            # swap rotation axes
+            rot[0], rot[1], rot[2] = 0, rot[0], 0
+
+            if abs(rot[0]) < 1:
+                rot[0] = 0
+            if abs(rot[1]) < 1:
+                rot[1] = 0
+            if abs(rot[2]) < 1:
+                rot[2] = 0
+            return rot
+
+        def get_action(vr_pos, vr_quat, arm):
+            rel_vr_pos = rel_pos(self.prev_vr_pos[arm], vr_pos)
+            # relative movement speed between VR and simulation
+            rel_vr_pos *= 3.5
+            # swap y, z axes
+            rel_vr_pos[0] = -rel_vr_pos[0]
+            rel_vr_pos[1], rel_vr_pos[2] = rel_vr_pos[2], rel_vr_pos[1]
+            rel_vr_quat = rel_quat(self.prev_vr_quat[arm], vr_quat)  # wxyz
+
+            sim_pos = self.sim.data.get_body_xpos(f"{arm}_hand").copy()
+            sim_quat = self.sim.data.get_body_xquat(f"{arm}_hand").copy()  # wxyz
+            sim_quat = T.convert_quat(T.mat2quat(self._right_hand_orn), to="wxyz")
+
+            rel_sim_pos = rel_pos(self.prev_sim_pos[arm], sim_pos)
+            rel_sim_quat = rel_quat(self.prev_sim_quat[arm], sim_quat)  # wxyz
+
+            action_pos = rel_pos(rel_sim_pos, rel_vr_pos)
+            action_quat = rel_quat(rel_sim_quat, rel_vr_quat)  # wxyz
+            action_quat = rel_quat(sim_quat, vr_quat)
+            action_rot = quat_to_rot(action_quat) / 100
+
+            if self._control_type == "ik":
+                return action_pos, action_rot
+            elif self._control_type == "ik_quaternion":
+                return action_pos, action_quat
+
+        flip_axis = np.array([[1, 0, 0], [0, 0, -1], [0, -1, 0]])
+        
+        (
+            vr_poses,
+            handle_press,
+            gripper_press,
+            connect_press,
+            reset_press,
+        ) = get_pose_and_button()
+
+        connect = -1
+        action_pos = default_action_pos.copy()
+        action_rot = default_action_rot.copy()
+        
+        gripper_change = {}
+        for arm in self._arms:
+            if handle_press[arm]:
+                if self.prev_handle_press[arm]:
+                    # compute action
+                    vr_pos = vr_poses[arm][:3, 3]
+                    tmp_vr_quat = T.convert_quat(
+                        T.mat2quat(vr_poses[arm][:3, :3]), to="wxyz"
+                    )
+                    # tmp_vr_quat = T.euler_to_quat([270, 0, 180],
+                    # tmp_vr_quat)  # matches world-frame orientation
+                    tmp_vr_quat = T.euler_to_quat([90, 0, 90], tmp_vr_quat)
+                    tmp_vr_mat = Quaternion(tmp_vr_quat).rotation_matrix
+                    tmp_vr_mat = flip_axis.T @ tmp_vr_mat @ flip_axis
+                    tmp_vr_mat = self.pose_in_base_from_pose(vr_pos, tmp_vr_mat)[
+                        :3, :3
+                    ]
+                    tmp_vr_quat = T.convert_quat(T.mat2quat(tmp_vr_mat), to="wxyz")
+                    action_pos[arm], action_rot[arm] = get_action(
+                        vr_pos, tmp_vr_quat, arm
+                    )
+                else:
+                    # reset reference vr pose
+                    self.prev_vr_pos[arm] = vr_poses[arm][:3, 3]
+                    tmp_vr_quat = T.convert_quat(
+                        T.mat2quat(vr_poses[arm][:3, :3]), to="wxyz"
+                    )
+                    tmp_vr_quat = T.euler_to_quat([90, 0, 90], tmp_vr_quat)
+                    tmp_vr_mat = Quaternion(tmp_vr_quat).rotation_matrix
+                    tmp_vr_mat = flip_axis.T @ tmp_vr_mat @ flip_axis
+                    tmp_vr_mat = self.pose_in_base_from_pose(
+                        self.prev_vr_pos[arm], tmp_vr_mat
+                    )[:3, :3]
+                    tmp_vr_quat = T.convert_quat(T.mat2quat(tmp_vr_mat), to="wxyz")
+                    self.prev_vr_quat[arm] = tmp_vr_quat
+
+                    # reset reference robot pose
+                    self.prev_sim_pos[arm] = self.sim.data.get_body_xpos(
+                        f"{arm}_hand"
+                    ).copy()
+                    self.prev_sim_quat[arm] = self.sim.data.get_body_xquat(
+                        f"{arm}_hand"
+                    ).copy()
+
+                self.tmp_vr_quat = tmp_vr_quat
+
+            gripper_change[arm] = False
+            if self.prev_gripper_press[arm] and not gripper_press[arm]:
+                self.select[arm] *= -1
+                gripper_change[arm] = True
+
+            self.prev_handle_press[arm] = handle_press[arm]
+            self.prev_gripper_press[arm] = gripper_press[arm]
+
+        if self.tmp_vr_quat is not None:
+            self._set_quat("VR_R", self.tmp_vr_quat)
+
+        if connect_press:
+            connect = 1
+        connect = 1
+
+        for arm in self._arms:
+            action_rot[arm] = np.array([1, 0, 0, 0])
+
+        action_items = []
+        for arm in self._arms:
+            action_items.append(action_pos[arm])
+            if self._control_type == "ik":
+                action_items.append(action_rot[arm] / self._rotate_speed)
+            else:
+                action_items.append(action_rot[arm])
+        for arm in self._arms:
+            action_items.append([self.select[arm]])
+        action_items.append([connect])
+
+        action = np.hstack(action_items)
+        action = np.clip(action, -1.0, 1.0)
+        
+        return action, reset_press, connect_press, handle_press["right"], gripper_change['right']
 
     def run_vr_oculus(self, cfg=None):
         """

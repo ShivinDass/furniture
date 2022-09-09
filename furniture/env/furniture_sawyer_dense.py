@@ -385,7 +385,7 @@ class FurnitureSawyerDenseRewardEnv(FurnitureSawyerEnv):
             else:
                 phase_info["wrong_connect"] = 1
                 self._success = False
-                done = True
+                # done = True
 
         elif phase == "init_eef":
             phase_reward, phase_info = self._init_eef_reward()

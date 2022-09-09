@@ -1,6 +1,8 @@
+from ast import ImportFrom
 import h5py
 import cv2
 import copy
+from getch import getch
 import pickle
 import gym
 import time
@@ -13,8 +15,7 @@ from furniture.env.models import furniture_name2id
 from assisted_teleop.utils.general_utils import AttrDict
 
 
-data_file = '/home/shivin/.furniture/datasets/Sawyer_three_blocks_teleop_data_full_task_no_rotation.hdf5'
-traj_save_file = '/home/shivin/.furniture/datasets/trajectory_visualization/Sawyer_three_blocks_simple_rollout_images'
+data_file = '/home/shivin/.furniture/datasets/Sawyer_three_blocks_teleop_data_multi_task.hdf5'
 
 block_names = ['1_block_l', '2_block_m', '3_block_r']
 
@@ -35,51 +36,138 @@ def get_init_action():
     return np.array(pos + rot + select + connect)
 
 def rollout(cfg):
-    agent_name = agent_names[1]
-    furniture_name = "three_blocks"
-    background_name = background_names[3]
-    cfg.ikea_cfg.unity.background = background_name
-    # set correct environment name based on agent_name
-    env_name = "IKEA{}-v0".format(agent_name)
-
-    
     # make environment following arguments
     env = gym.make(
-        env_name, furniture_name=furniture_name, unity={"background": background_name}, ikea_cfg=cfg.ikea_cfg
+        "IKEA{}-v0".format(agent_names[1]), furniture_name="three_blocks", unity={"background": background_names[3]}, ikea_cfg=cfg.ikea_cfg
     )
 
     f = h5py.File(data_file, 'r')
     
+    seq_end_idxs = np.where(f['terminals'])[0]
+
+    start_index = 0
     env.reset()
-    env.env.init_pos, env.env.init_quat = get_block_pos_from_obs(f['observations'][0])
+    env.env.init_pos, env.env.init_quat = get_block_pos_from_obs(f['observations'][start_index])
     env.env.fixed_parts = []
     env.reset()
 
-    init_action = get_init_action()
-    env.step(init_action)
-    
+    episode_count = 0
     count_success = 0
-    for i,a in enumerate(f['actions']):
-        obs, _, done, _ = env.step(a)
-        
+    # img_list = []
+    # obs_list = []
+    for i,a in enumerate(f['actions'][start_index:]):
+        obs, reward, done, _ = env.step(a)
         env.render()
-        # input()
-        # time.sleep(0.5)
         
+        # img = cv2.cvtColor(env.render(mode='rgb_array')[0], cv2.COLOR_BGR2RGB)
+        # img_list.append(img)
+        # obs_list.append(np.concatenate((obs['object_ob'], obs['robot_ob']), axis=0))
+
         if f['terminals'][i]:
-            env.env.init_pos, env.env.init_quat = get_block_pos_from_obs(f['observations'][i+1])
-            env.env.fixed_parts = []
-            env.reset()
-
-            env.step(init_action)
-
             if done:
                 count_success += 1
+
+            episode_count += 1
+            if episode_count < len(seq_end_idxs):
+                env.env.init_pos, env.env.init_quat = get_block_pos_from_obs(f['observations'][i+start_index+1])
+                env.env.fixed_parts = []
+                env.reset()
+
+            # save_dir = '/home/shivin/.furniture/datasets/Sawyer_three_blocks_teleop_data_multi_task/'
+            # with h5py.File(os.path.join(save_dir, 'demo{}.hdf5'.format(episode_count)), 'w') as g:
+            #     g.create_dataset('observations',data=np.array(obs_list))
+            #     g.create_dataset('images', data=np.array(img_list))
+
+            # del img_list
+            # del obs_list
+            # img_list = []
+            # obs_list = []
             
-            print("Total", count_success, "successes out of", 1 + np.sum(f['terminals'][:i]))
+            print("Total", count_success, "successes out of", 1 + np.sum(f['terminals'][start_index: i+start_index]))
+
     env.close()
 
+def select_rollout_frames(cfg):
+    env = gym.make(
+        "IKEA{}-v0".format(agent_names[1]), furniture_name="three_blocks", unity={"background": background_names[3]}, ikea_cfg=cfg.ikea_cfg
+    )
+
+    f = h5py.File(data_file, 'r')
+    
+    seq_end_idxs = np.concatenate(([0], np.where(f['terminals'])[0]), axis=0)
+
+    env.reset()
+    env.env.init_pos, env.env.init_quat = get_block_pos_from_obs(f['observations'][0])
+    env.env.fixed_parts = []
+    obs = env.reset()
+
+    selected_frames = {'observations': [], 'images': [], 'captions': []}
+
+    index = 0
+    max_ind = 0
+    img_list = []
+    obs_list = []
+    episode_count = 0
+    quit_now = False
+    while 1>0:
+
+        img = cv2.cvtColor(env.render(mode='rgb_array')[0], cv2.COLOR_BGR2RGB)
+        img_list.append(img)
+        obs_list.append(np.concatenate((obs['object_ob'], obs['robot_ob']), axis=0))
+
+        while index <= max_ind:
+            cv2.imshow('cur_frame', img_list[index-seq_end_idxs[episode_count]-1])
+            cv2.waitKey(1)
+            
+            keypress = getch()
+
+            if keypress == 'd':
+                index = min(seq_end_idxs[-1], index+1)
+            elif keypress == 'a':
+                index = max(seq_end_idxs[episode_count], index-1)
+            elif keypress == 'y':
+                print()
+                caption = input('caption: ')
+
+                selected_frames['captions'].append(caption.encode('ascii', 'ignore'))
+                selected_frames['observations'].append(obs_list[index])
+                selected_frames['images'].append(img_list[index])
+
+            elif keypress == 'q':
+                quit_now = True
+                break
+
+        if quit_now:
+            save_file = '/home/shivin/.furniture/datasets/Sawyer_three_blocks_teleop_data_multi_task_diverse_frames.hdf5'
+            with h5py.File(save_file, 'w') as g:
+                g.create_dataset('observations',data=np.array(selected_frames['observations']))
+                g.create_dataset('images', data=np.array(selected_frames['images']))
+                g.create_dataset('captions', data=selected_frames['captions'])
+            break
+
+        if f['terminals'][index]:
+            if index < seq_end_idxs[-1]:
+                episode_count += 1
+                index += 1
+
+                env.env.init_pos, env.env.init_quat = get_block_pos_from_obs(f['observations'][index])
+                env.env.fixed_parts = []
+                env.reset()
+
+                del img_list
+                del obs_list
+                img_list = []
+                obs_list = []
+
+        a = f['actions'][index]
+        obs, reward, done, _ = env.step(a)
+
+        max_ind = max(index, max_ind)
+
+
 def generate_blended_demo(cfg):
+    traj_save_file = '/home/shivin/.furniture/datasets/trajectory_visualization/Sawyer_three_blocks_simple_rollout_images'
+
     from assisted_teleop.configs.default_data_configs.furniture import data_spec
     from assisted_teleop.data.furniture.src.furniture_data_loader import OculusVRSequenceSplitDataset
 
@@ -149,20 +237,30 @@ def main(cfg: DictConfig) -> None:
     cfg.env.ikea_cfg.render = True
     cfg.env.ikea_cfg.control_type = "ik_quaternion"
     cfg.env.ikea_cfg.max_episode_steps = 10000
-    cfg.env.ikea_cfg.screen_size = [1024, 1024]
+    cfg.env.ikea_cfg.screen_size = [448, 448]
     cfg.env.ikea_cfg.seed = 1
     cfg.env.ikea_cfg.fix_init_parts = block_names
 
-    #Noise for randomizing furniture placement
-    cfg.env.ikea_cfg.furn_xyz_rand = 0.1   
-    cfg.env.ikea_cfg.furn_rot_rand = 7
+    #Different camera perspectives
+    # cfg.env.ikea_cfg.camera_ids = [0, 1]
+    
+    # #Noise for randomizing furniture placement
+    # cfg.env.ikea_cfg.furn_xyz_rand = 0.1   
+    # cfg.env.ikea_cfg.furn_rot_rand = 6
 
     #Relaxing constraints for easier task assembly
-    cfg.env.ikea_cfg.alignment_pos_dist = 0.1
+    cfg.env.ikea_cfg.alignment_pos_dist = 0.015
     cfg.env.ikea_cfg.alignment_rot_dist_up = 0.8
     cfg.env.ikea_cfg.alignment_rot_dist_forward = 0.8
+    
+    #set rewards
+    for k in cfg.env.ikea_cfg.reward.keys():
+        cfg.env.ikea_cfg.reward[k] = 0
+    cfg.env.ikea_cfg.reward.success = 100
+    cfg.env.ikea_cfg.reward.pick = 10
 
-    rollout(cfg.env)
+    # rollout(cfg.env)
+    select_rollout_frames(cfg.env)
     # generate_blended_demo(cfg.env)
 
 def playback_blended_rollouts(traj_save_file):
