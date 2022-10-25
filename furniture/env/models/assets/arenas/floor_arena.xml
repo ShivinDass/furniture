@@ -7,6 +7,8 @@
 
     <worldbody>
         <geom condim="3" rgba="0.7 0.7 0.7 1" name="FLOOR" pos="0 0 0" size="0.5 0.5 .125" type="plane" />
+        <geom condim="3" rgba="1.0 0. 0. 0.3" name="HUMAN_HELP" pos="0 -2. 0.0" size="0.5 0.1 0.01" type="box" />
+        <geom condim="3" rgba="0. 1. 0. 0.3" name="HUMAN_CONTROL" pos="0. -2 0.1" size="0.07 0.07 0.01" type="box" />
 
         <body name="VR_R" pos="0.2 -0.2 0.3">
             <site rgba="0.7 0.2 0.2 1" name="VR_R_x" pos="0.05 0 0" size="0.05 0.002 0.002" type="box" />

@@ -340,7 +340,7 @@ class FurnitureEnv(metaclass=EnvMeta):
             self._demo.add(ob=ob)
             self._demo.add(low_level_ob=self._get_obs(include_qpos=True))
 
-        return self.reset_vr() # return ob
+        return ob #self.reset_vr() # return ob
 
     def _init_random(self, size, name):
         """
@@ -3309,7 +3309,9 @@ class FurnitureEnv(metaclass=EnvMeta):
                             )
 
                 logger.info(f"Action: {action}")
+                action = action / 10
                 ob, reward, done, info = self.step(action)
+                print(self.sim.data.qpos)
 
                 if cfg.record_vid:
                     self._video.capture_frame(self.render("rgb_array")[0])

@@ -16,6 +16,7 @@ from assisted_teleop.utils.general_utils import AttrDict
 
 
 data_file = '/home/shivin/.furniture/datasets/Sawyer_three_blocks_teleop_data_multi_task.hdf5'
+data_file = '/home/icaros/data/furniture/Sawyer_three_blocks_teleop_data_multi_task_gripper_labels.hdf5'
 
 block_names = ['1_block_l', '2_block_m', '3_block_r']
 
@@ -56,6 +57,7 @@ def rollout(cfg):
     # img_list = []
     # obs_list = []
     for i,a in enumerate(f['actions'][start_index:]):
+        #a = np.concatenate([a[:3], a[5:]])
         obs, reward, done, _ = env.step(a)
         env.render()
         
@@ -259,8 +261,8 @@ def main(cfg: DictConfig) -> None:
     cfg.env.ikea_cfg.reward.success = 100
     cfg.env.ikea_cfg.reward.pick = 10
 
-    # rollout(cfg.env)
-    select_rollout_frames(cfg.env)
+    rollout(cfg.env)
+    #select_rollout_frames(cfg.env)
     # generate_blended_demo(cfg.env)
 
 def playback_blended_rollouts(traj_save_file):
