@@ -41,7 +41,6 @@ from ..util import Qpos, PrettySafeLoader
 
 from assisted_teleop.configs.default_data_configs.furniture import data_spec
 from assisted_teleop.utils.general_utils import AttrDict
-from assisted_teleop.models.bc_ensemble_mdl import BCEnsembleMdl
 from assisted_teleop.components.checkpointer import CheckpointHandler, get_config_path
 
 np.set_printoptions(suppress=True)
